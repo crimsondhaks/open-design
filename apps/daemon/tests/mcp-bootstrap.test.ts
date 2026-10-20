@@ -7,14 +7,18 @@ import {
   planMcpDaemonBootstrap,
 } from "../src/mcp-bootstrap.js";
 
-// Advances only when the code under test sleeps, so retry budgets are exact
-// and the tests never wait in real time.
+// A clock the test controls, so retry budgets are exact and nothing waits in
+// real time. `sleep` advances it; slow fakes call `advance` to model discovery
+// and health answers that take their full timeout.
 function fakeClock() {
   let current = 1_000_000;
   const start = current;
   return {
     now: () => current,
     sleep: async (milliseconds: number) => {
+      current += milliseconds;
+    },
+    advance: (milliseconds: number) => {
       current += milliseconds;
     },
     elapsed: () => current - start,
@@ -192,6 +196,33 @@ describe("ensureMcpDaemonUrl", () => {
     expect(discoverTargetDaemonUrl.mock.calls.length).toBeGreaterThan(1);
     // Startup must still settle well inside an MCP client's startup timeout.
     expect(clock.elapsed()).toBeLessThanOrEqual(6_000);
+  });
+
+  it("keeps discovery and health probes inside the startup budget when every answer is slow", async () => {
+    const clock = fakeClock();
+    const discoveryTimeouts: number[] = [];
+    const probeTimeouts: number[] = [];
+    await expect(ensureMcpDaemonUrl({
+      env: {},
+      connectInherited: (() => ({ status: vi.fn() })) as never,
+      // Each call answers only when its timeout runs out.
+      discoverTargetDaemonUrl: async (_env, timeoutMs) => {
+        discoveryTimeouts.push(timeoutMs);
+        clock.advance(timeoutMs);
+        return "http://127.0.0.1:61234";
+      },
+      probeDaemon: async (_url, timeoutMs = 800) => {
+        probeTimeouts.push(timeoutMs);
+        clock.advance(timeoutMs);
+        return false;
+      },
+      ...clock,
+    })).rejects.toThrow(/bootstrap-unavailable/);
+    expect(discoveryTimeouts.length).toBeGreaterThan(1);
+    expect(clock.elapsed()).toBeLessThanOrEqual(6_000);
+    for (const timeoutMs of [...discoveryTimeouts, ...probeTimeouts]) {
+      expect(timeoutMs).toBeGreaterThan(0);
+    }
   });
 
   it("reports the original discovery error once the budget is spent", async () => {

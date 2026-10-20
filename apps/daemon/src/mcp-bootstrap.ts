@@ -23,6 +23,8 @@ const UNMANAGED_DISCOVERY_FIRST_TIMEOUT_MS = 800;
 const UNMANAGED_DISCOVERY_MAX_TIMEOUT_MS = 3_000;
 const UNMANAGED_DISCOVERY_FIRST_RETRY_DELAY_MS = 250;
 const UNMANAGED_DISCOVERY_MAX_RETRY_DELAY_MS = 1_000;
+// Below this, another attempt cannot answer in time, so it is not started.
+const UNMANAGED_DISCOVERY_MIN_ATTEMPT_MS = 200;
 
 export type McpDaemonBootstrapPlan =
   | {
@@ -186,20 +188,29 @@ export async function ensureMcpDaemonUrl(
           timeoutMs: attemptTimeoutMs,
         });
 
+  // The first attempt keeps the original 800 ms limits. Every later blocking
+  // call (discovery, health probe, retry delay) is capped to the budget that
+  // is left when it starts, so startup never runs past the deadline.
   const discoveryDeadline = now() + (options.discoveryRetryBudgetMs ?? UNMANAGED_DISCOVERY_BUDGET_MS);
   let attemptTimeoutMs = UNMANAGED_DISCOVERY_FIRST_TIMEOUT_MS;
   let retryDelayMs = UNMANAGED_DISCOVERY_FIRST_RETRY_DELAY_MS;
+  let firstAttempt = true;
+  const callTimeout = (): number =>
+    firstAttempt ? attemptTimeoutMs : Math.min(attemptTimeoutMs, discoveryDeadline - now());
   let plan: McpDaemonBootstrapPlan;
   for (;;) {
     let daemonUrl: string | null = null;
     let discoveryError: unknown = null;
     try {
-      daemonUrl = await discoverUnmanagedDaemon(attemptTimeoutMs);
+      daemonUrl = await discoverUnmanagedDaemon(callTimeout());
     } catch (err) {
       discoveryError = err;
     }
-    const daemonReachable =
-      daemonUrl != null && await probeDaemon(daemonUrl, attemptTimeoutMs);
+    let daemonReachable = false;
+    if (daemonUrl != null) {
+      const probeTimeoutMs = callTimeout();
+      daemonReachable = probeTimeoutMs > 0 && await probeDaemon(daemonUrl, probeTimeoutMs);
+    }
     plan = planMcpDaemonBootstrap({
       daemonReachable,
       env,
@@ -210,17 +221,18 @@ export async function ensureMcpDaemonUrl(
     // Only a missing launcher is worth waiting out. A malformed registration
     // will not repair itself, so it still fails on the first attempt.
     const remainingMs = discoveryDeadline - now();
-    if (plan.reason !== "bootstrap-unavailable" || remainingMs <= retryDelayMs) {
+    if (
+      plan.reason !== "bootstrap-unavailable"
+      || remainingMs < retryDelayMs + UNMANAGED_DISCOVERY_MIN_ATTEMPT_MS
+    ) {
       if (discoveryError != null) throw discoveryError;
       throw new Error(
         `The registered OpenDesign runtime is unavailable and cannot be launched (${plan.reason}).`,
       );
     }
     await sleep(retryDelayMs);
-    attemptTimeoutMs = Math.max(
-      UNMANAGED_DISCOVERY_FIRST_TIMEOUT_MS,
-      Math.min(attemptTimeoutMs * 2, UNMANAGED_DISCOVERY_MAX_TIMEOUT_MS, remainingMs - retryDelayMs),
-    );
+    firstAttempt = false;
+    attemptTimeoutMs = Math.min(attemptTimeoutMs * 2, UNMANAGED_DISCOVERY_MAX_TIMEOUT_MS);
     retryDelayMs = Math.min(retryDelayMs * 2, UNMANAGED_DISCOVERY_MAX_RETRY_DELAY_MS);
   }
 
