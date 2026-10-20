@@ -26,6 +26,7 @@ import { APP_KEYS } from '@open-design/sidecar-proto';
 
 import {
   buildPackagedDaemonSpawnEnv,
+  buildPackagedWebSpawnEnv,
   closeManagedChild,
   createPackagedSidecarSpawnOptions,
   createRestartPolicy,
@@ -1255,5 +1256,37 @@ describe('packaged sidecar log rotation', () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe('buildPackagedWebSpawnEnv', () => {
+  // Issue #7284: the standalone web server runs from the signed, read-only
+  // app bundle, so its Next.js runtime cache must point at mutable,
+  // namespace-scoped app data rather than default to the bundle.
+  const paths = { cacheRoot: '/tmp/od-pkg/cache' };
+
+  it('points the standalone web cache at the namespace cache root', () => {
+    const env = buildPackagedWebSpawnEnv(paths, {
+      daemonPort: '17456',
+      webOutputMode: 'standalone',
+      webStandaloneRoot: '/Applications/Open Design.app/Contents/Resources/open-design-web-standalone',
+    });
+
+    expect(slashPath(env.OD_WEB_CACHE_DIR ?? '')).toBe('/tmp/od-pkg/cache/web');
+    expect(env.OD_WEB_STANDALONE_ROOT).toBe('/Applications/Open Design.app/Contents/Resources/open-design-web-standalone');
+    expect(env.OD_WEB_OUTPUT_MODE).toBe('standalone');
+    expect(env.OD_PORT).toBe('17456');
+  });
+
+  it('leaves the server output mode without a standalone cache dir', () => {
+    const env = buildPackagedWebSpawnEnv(paths, {
+      daemonPort: '17456',
+      webOutputMode: 'server',
+      webStandaloneRoot: null,
+    });
+
+    expect(env).not.toHaveProperty('OD_WEB_CACHE_DIR');
+    expect(env).not.toHaveProperty('OD_WEB_STANDALONE_ROOT');
+    expect(env.OD_WEB_OUTPUT_MODE).toBe('server');
   });
 });
